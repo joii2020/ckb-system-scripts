@@ -6,7 +6,6 @@ AR := llvm-ar-16
 # LD_SCRIPT := -T c/ld_interface.ld
 
 CFLAGS := --target=riscv64 -march=rv64imc_zba_zbb_zbc_zbs -O3 -fno-builtin-printf -fno-builtin-memcmp -nostdinc -nostdlib -fvisibility=hidden -fdata-sections -ffunction-sections -I deps/molecule -I deps/secp256k1/src -I deps/secp256k1 -I c -I build -I deps/ckb-c-stdlib -I deps/ckb-c-stdlib/libc
-LDFLAGS := -Wl,--gc-sections
 
 SECP256K1_SRC := deps/secp256k1/src/ecmult_static_pre_context.h
 MOLC := moleculec
