@@ -1,6 +1,6 @@
 use super::{
-    blake160, sign_tx, sign_tx_by_input_group, DummyDataLoader, MAX_CYCLES, SECP256K1_DATA_BIN,
-    SIGHASH_ALL_BIN,
+    blake160, sign_tx, sign_tx_by_input_group, DummyDataLoader, SigHashAllBinType, MAX_CYCLES,
+    SECP256K1_DATA_BIN,
 };
 use ckb_crypto::secp::{Generator, Privkey};
 use ckb_error::assert_error_eq;
@@ -15,15 +15,54 @@ use ckb_types::{
     prelude::*,
     H256,
 };
-use rand::{thread_rng, Rng, SeedableRng};
+use rand::{thread_rng, Rng, RngCore, SeedableRng};
 use std::sync::Arc;
 
 const ERROR_ENCODING: i8 = -2;
 const ERROR_WITNESS_SIZE: i8 = -22;
 const ERROR_PUBKEY_BLAKE160_HASH: i8 = -31;
 
-fn gen_lock_script(lock_args: Bytes) -> Script {
-    let sighash_all_cell_data_hash = CellOutput::calc_data_hash(&SIGHASH_ALL_BIN);
+struct FixRng {
+    count: u64,
+}
+
+impl Default for FixRng {
+    fn default() -> Self {
+        Self { count: 0 }
+    }
+}
+
+impl RngCore for FixRng {
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        let mut buf = Vec::with_capacity(dest.len());
+        buf.resize(dest.len(), self.count as u8);
+        self.count += 1;
+        dest.copy_from_slice(&buf);
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        let r = self.count;
+        self.count += 1;
+        r as u32
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let r = self.count;
+        self.count += 1;
+        r
+    }
+
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand::Error> {
+        let mut buf = Vec::with_capacity(dest.len());
+        buf.resize(dest.len(), self.count as u8);
+        self.count += 1;
+        dest.copy_from_slice(&buf);
+        Ok(())
+    }
+}
+
+fn gen_lock_script(lock_args: Bytes, t: &SigHashAllBinType) -> Script {
+    let sighash_all_cell_data_hash = CellOutput::calc_data_hash(t.get_bin());
     Script::new_builder()
         .args(lock_args.pack())
         .code_hash(sighash_all_cell_data_hash)
@@ -31,15 +70,16 @@ fn gen_lock_script(lock_args: Bytes) -> Script {
         .build()
 }
 
-fn gen_tx(dummy: &mut DummyDataLoader, lock_args: Bytes) -> TransactionView {
+fn gen_tx(dummy: &mut DummyDataLoader, lock_args: Bytes, t: &SigHashAllBinType) -> TransactionView {
     let mut rng = thread_rng();
-    gen_tx_with_grouped_args(dummy, vec![(lock_args, 1)], &mut rng)
+    gen_tx_with_grouped_args(dummy, vec![(lock_args, 1)], &mut rng, t)
 }
 
 fn gen_tx_with_grouped_args<R: Rng>(
     dummy: &mut DummyDataLoader,
     grouped_args: Vec<(Bytes, usize)>,
     rng: &mut R,
+    t: &SigHashAllBinType,
 ) -> TransactionView {
     // setup sighash_all dep
     let sighash_all_out_point = {
@@ -53,14 +93,14 @@ fn gen_tx_with_grouped_args<R: Rng>(
     // dep contract code
     let sighash_all_cell = CellOutput::new_builder()
         .capacity(
-            Capacity::bytes(SIGHASH_ALL_BIN.len())
+            Capacity::bytes(t.get_bin().len())
                 .expect("script capacity")
                 .pack(),
         )
         .build();
     dummy.cells.insert(
         sighash_all_out_point.clone(),
-        (sighash_all_cell, SIGHASH_ALL_BIN.clone()),
+        (sighash_all_cell, t.get_bin().clone()),
     );
     // setup secp256k1_data dep
     let secp256k1_data_out_point = {
@@ -113,7 +153,7 @@ fn gen_tx_with_grouped_args<R: Rng>(
                 buf.pack()
             };
             let previous_out_point = OutPoint::new(previous_tx_hash, 0);
-            let script = gen_lock_script(args.clone());
+            let script = gen_lock_script(args.clone(), t);
             let previous_output_cell = CellOutput::new_builder()
                 .capacity(dummy_capacity.pack())
                 .lock(script)
@@ -190,12 +230,67 @@ fn test_sighash_all_unlock() {
     let privkey = Generator::random_privkey();
     let pubkey = privkey.pubkey().expect("pubkey");
     let pubkey_hash = blake160(&pubkey.serialize());
-    let tx = gen_tx(&mut data_loader, pubkey_hash);
+    let tx = gen_tx(&mut data_loader, pubkey_hash, &SigHashAllBinType::default());
     let tx = sign_tx(tx, &privkey);
     let resolved_tx = Arc::new(build_resolved_tx(&data_loader, &tx));
     let verify_result =
         TransactionScriptsVerifier::new(resolved_tx, data_loader).verify(MAX_CYCLES);
-    verify_result.expect("pass verification");
+    let cycles = verify_result.expect("pass verification");
+    println!("cycles: {}", cycles);
+}
+
+#[cfg(feature = "test_llvm_version")]
+fn run_benchmark(t: SigHashAllBinType) -> u64 {
+    let mut data_loader = DummyDataLoader::new();
+    // let privkey = Generator::random_privkey();
+    let privkey = Generator::non_crypto_safe_prng(123).gen_privkey();
+    let pubkey = privkey.pubkey().expect("pubkey");
+    let pubkey_hash = blake160(&pubkey.serialize());
+    println!("--- pubkeyhash: {:02x?}", pubkey_hash.to_vec());
+
+    let mut rng = FixRng::default();
+    let tx = gen_tx_with_grouped_args(&mut data_loader, vec![(pubkey_hash, 1)], &mut rng, &t);
+
+    let tx = sign_tx(tx, &privkey);
+    let resolved_tx = Arc::new(build_resolved_tx(&data_loader, &tx));
+    let verify_result =
+        TransactionScriptsVerifier::new(resolved_tx, data_loader).verify(MAX_CYCLES);
+    let cycles = verify_result.expect("pass verification");
+    cycles
+}
+
+
+#[cfg(feature = "test_llvm_version")]
+#[test]
+fn test_sighash_benchmark() {
+    run_benchmark(SigHashAllBinType::Def);
+    let c_16 = run_benchmark(SigHashAllBinType::LLVM16);
+    let c_17 = run_benchmark(SigHashAllBinType::LLVM17);
+    let c_18 = run_benchmark(SigHashAllBinType::LLVM18);
+
+    println!(
+        "-- LLVM 16 cycles: {}({:.2}k), size: {}({:.2}k)",
+        c_16,
+        c_16 as f64 / 1024.0,
+        SigHashAllBinType::LLVM16.get_bin().len(),
+        SigHashAllBinType::LLVM16.get_bin().len() as f64 / 1024.0
+    );
+
+    println!(
+        "-- LLVM 17 cycles: {}({:.2}k), size: {}({:.2}k)",
+        c_17,
+        c_17 as f64 / 1024.0,
+        SigHashAllBinType::LLVM17.get_bin().len(),
+        SigHashAllBinType::LLVM17.get_bin().len() as f64 / 1024.0
+    );
+
+    println!(
+        "-- LLVM 18 cycles: {}({:.2}k), size: {}({:.2}k)",
+        c_18,
+        c_18 as f64 / 1024.0,
+        SigHashAllBinType::LLVM18.get_bin().len(),
+        SigHashAllBinType::LLVM18.get_bin().len() as f64 / 1024.0,
+    );
 }
 
 #[test]
@@ -204,8 +299,8 @@ fn test_sighash_all_with_extra_witness_unlock() {
     let privkey = Generator::random_privkey();
     let pubkey = privkey.pubkey().expect("pubkey");
     let pubkey_hash = blake160(&pubkey.serialize());
-    let lock_script = gen_lock_script(pubkey_hash.clone());
-    let tx = gen_tx(&mut data_loader, pubkey_hash);
+    let lock_script = gen_lock_script(pubkey_hash.clone(), &SigHashAllBinType::default());
+    let tx = gen_tx(&mut data_loader, pubkey_hash, &SigHashAllBinType::default());
     let extract_witness = vec![1, 2, 3, 4];
     let tx = tx
         .as_advanced_builder()
@@ -256,8 +351,13 @@ fn test_sighash_all_with_grouped_inputs_unlock() {
     let privkey = Generator::random_privkey();
     let pubkey = privkey.pubkey().expect("pubkey");
     let pubkey_hash = blake160(&pubkey.serialize());
-    let lock_script = gen_lock_script(pubkey_hash.clone());
-    let tx = gen_tx_with_grouped_args(&mut data_loader, vec![(pubkey_hash, 2)], &mut rng);
+    let lock_script = gen_lock_script(pubkey_hash.clone(), &SigHashAllBinType::default());
+    let tx = gen_tx_with_grouped_args(
+        &mut data_loader,
+        vec![(pubkey_hash, 2)],
+        &mut rng,
+        &SigHashAllBinType::default(),
+    );
     {
         let tx = sign_tx(tx.clone(), &privkey);
         let resolved_tx = Arc::new(build_resolved_tx(&data_loader, &tx));
@@ -313,6 +413,7 @@ fn test_sighash_all_with_2_different_inputs_unlock() {
         &mut data_loader,
         vec![(pubkey_hash, 2), (pubkey_hash2, 2)],
         &mut rng,
+        &SigHashAllBinType::default(),
     );
     let tx = sign_tx_by_input_group(tx, &privkey, 0, 2);
     let tx = sign_tx_by_input_group(tx, &privkey2, 2, 2);
@@ -330,8 +431,8 @@ fn test_signing_with_wrong_key() {
     let wrong_privkey = Generator::random_privkey();
     let pubkey = privkey.pubkey().expect("pubkey");
     let pubkey_hash = blake160(&pubkey.serialize());
-    let lock_script = gen_lock_script(pubkey_hash.clone());
-    let tx = gen_tx(&mut data_loader, pubkey_hash);
+    let lock_script = gen_lock_script(pubkey_hash.clone(), &SigHashAllBinType::default());
+    let tx = gen_tx(&mut data_loader, pubkey_hash, &SigHashAllBinType::default());
     let tx = sign_tx(tx, &wrong_privkey);
     let resolved_tx = Arc::new(build_resolved_tx(&data_loader, &tx));
     let verify_result =
@@ -349,8 +450,8 @@ fn test_signing_wrong_tx_hash() {
     let privkey = Generator::random_privkey();
     let pubkey = privkey.pubkey().expect("pubkey");
     let pubkey_hash = blake160(&pubkey.serialize());
-    let lock_script = gen_lock_script(pubkey_hash.clone());
-    let tx = gen_tx(&mut data_loader, pubkey_hash);
+    let lock_script = gen_lock_script(pubkey_hash.clone(), &SigHashAllBinType::default());
+    let tx = gen_tx(&mut data_loader, pubkey_hash, &SigHashAllBinType::default());
     let tx = {
         let mut rand_tx_hash = [0u8; 32];
         let mut rng = thread_rng();
@@ -373,8 +474,8 @@ fn test_super_long_witness() {
     let privkey = Generator::random_privkey();
     let pubkey = privkey.pubkey().expect("pubkey");
     let pubkey_hash = blake160(&pubkey.serialize());
-    let lock_script = gen_lock_script(pubkey_hash.clone());
-    let tx = gen_tx(&mut data_loader, pubkey_hash);
+    let lock_script = gen_lock_script(pubkey_hash.clone(), &SigHashAllBinType::default());
+    let tx = gen_tx(&mut data_loader, pubkey_hash, &SigHashAllBinType::default());
     let tx_hash = tx.hash();
 
     let mut buffer: Vec<u8> = vec![];
@@ -430,6 +531,7 @@ fn test_sighash_all_2_in_2_out_cycles() {
         &mut data_loader,
         vec![(pubkey_hash, 1), (pubkey_hash2, 1)],
         &mut rng,
+        &SigHashAllBinType::default(),
     );
     let tx = sign_tx_by_input_group(tx, &privkey, 0, 1);
     let tx = sign_tx_by_input_group(tx, &privkey2, 1, 1);
@@ -448,10 +550,15 @@ fn test_sighash_all_witness_append_junk_data() {
     let privkey = Generator::random_privkey();
     let pubkey = privkey.pubkey().expect("pubkey");
     let pubkey_hash = blake160(&pubkey.serialize());
-    let lock_script = gen_lock_script(pubkey_hash.clone());
+    let lock_script = gen_lock_script(pubkey_hash.clone(), &SigHashAllBinType::default());
 
     // sign with 2 keys
-    let tx = gen_tx_with_grouped_args(&mut data_loader, vec![(pubkey_hash, 2)], &mut rng);
+    let tx = gen_tx_with_grouped_args(
+        &mut data_loader,
+        vec![(pubkey_hash, 2)],
+        &mut rng,
+        &SigHashAllBinType::default(),
+    );
     let tx = sign_tx_by_input_group(tx, &privkey, 0, 2);
     let mut witnesses: Vec<_> = Unpack::<Vec<_>>::unpack(&tx.witnesses());
     // append junk data to first witness
@@ -487,9 +594,14 @@ fn test_sighash_all_witness_args_ambiguity() {
     let privkey = Generator::random_privkey();
     let pubkey = privkey.pubkey().expect("pubkey");
     let pubkey_hash = blake160(&pubkey.serialize());
-    let lock_script = gen_lock_script(pubkey_hash.clone());
+    let lock_script = gen_lock_script(pubkey_hash.clone(), &SigHashAllBinType::default());
 
-    let tx = gen_tx_with_grouped_args(&mut data_loader, vec![(pubkey_hash, 2)], &mut rng);
+    let tx = gen_tx_with_grouped_args(
+        &mut data_loader,
+        vec![(pubkey_hash, 2)],
+        &mut rng,
+        &SigHashAllBinType::default(),
+    );
     let tx = sign_tx_by_input_group(tx, &privkey, 0, 2);
     let witnesses: Vec<_> = Unpack::<Vec<_>>::unpack(&tx.witnesses());
     // move input_type data to output_type
@@ -534,9 +646,14 @@ fn test_sighash_all_witnesses_ambiguity() {
     let privkey = Generator::random_privkey();
     let pubkey = privkey.pubkey().expect("pubkey");
     let pubkey_hash = blake160(&pubkey.serialize());
-    let lock_script = gen_lock_script(pubkey_hash.clone());
+    let lock_script = gen_lock_script(pubkey_hash.clone(), &SigHashAllBinType::default());
 
-    let tx = gen_tx_with_grouped_args(&mut data_loader, vec![(pubkey_hash, 3)], &mut rng);
+    let tx = gen_tx_with_grouped_args(
+        &mut data_loader,
+        vec![(pubkey_hash, 3)],
+        &mut rng,
+        &SigHashAllBinType::default(),
+    );
     let witness = Unpack::<Vec<_>>::unpack(&tx.witnesses()).remove(0);
     let tx = tx
         .as_advanced_builder()
@@ -577,9 +694,14 @@ fn test_sighash_all_cover_extra_witnesses() {
     let privkey = Generator::random_privkey();
     let pubkey = privkey.pubkey().expect("pubkey");
     let pubkey_hash = blake160(&pubkey.serialize());
-    let lock_script = gen_lock_script(pubkey_hash.clone());
+    let lock_script = gen_lock_script(pubkey_hash.clone(), &SigHashAllBinType::default());
 
-    let tx = gen_tx_with_grouped_args(&mut data_loader, vec![(pubkey_hash, 2)], &mut rng);
+    let tx = gen_tx_with_grouped_args(
+        &mut data_loader,
+        vec![(pubkey_hash, 2)],
+        &mut rng,
+        &SigHashAllBinType::default(),
+    );
     let witness = Unpack::<Vec<_>>::unpack(&tx.witnesses()).remove(0);
     let tx = tx
         .as_advanced_builder()

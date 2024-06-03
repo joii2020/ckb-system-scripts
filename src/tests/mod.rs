@@ -27,6 +27,49 @@ lazy_static! {
         Bytes::from(&include_bytes!("../../specs/cells/secp256k1_blake160_multisig_all")[..]);
 }
 
+#[cfg(feature = "test_llvm_version")]
+lazy_static! {
+    pub static ref SIGHASH_ALL_BIN_LLVM_16: Bytes = Bytes::from(
+        &include_bytes!("../../specs/cells/secp256k1_blake160_sighash_all_llvm_16")[..]
+    );
+    pub static ref SIGHASH_ALL_BIN_LLVM_17: Bytes = Bytes::from(
+        &include_bytes!("../../specs/cells/secp256k1_blake160_sighash_all_llvm_17")[..]
+    );
+    pub static ref SIGHASH_ALL_BIN_LLVM_18: Bytes = Bytes::from(
+        &include_bytes!("../../specs/cells/secp256k1_blake160_sighash_all_llvm_18")[..]
+    );
+}
+
+pub enum SigHashAllBinType {
+    Def,
+    #[cfg(feature = "test_llvm_version")]
+    LLVM16,
+    #[cfg(feature = "test_llvm_version")]
+    LLVM17,
+    #[cfg(feature = "test_llvm_version")]
+    LLVM18,
+}
+
+impl SigHashAllBinType {
+    pub fn get_bin<'a>(&self) -> &'a Bytes {
+        match self {
+            Self::Def => &SIGHASH_ALL_BIN,
+            #[cfg(feature = "test_llvm_version")]
+            Self::LLVM16 => &SIGHASH_ALL_BIN_LLVM_16,
+            #[cfg(feature = "test_llvm_version")]
+            Self::LLVM17 => &SIGHASH_ALL_BIN_LLVM_17,
+            #[cfg(feature = "test_llvm_version")]
+            Self::LLVM18 => &SIGHASH_ALL_BIN_LLVM_18,
+        }
+    }
+}
+
+impl Default for SigHashAllBinType {
+    fn default() -> Self {
+        SigHashAllBinType::Def
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct DummyDataLoader {
     pub cells: HashMap<OutPoint, (CellOutput, Bytes)>,
@@ -106,6 +149,7 @@ pub fn sign_tx_by_input_group(
                 });
                 blake2b.finalize(&mut message);
                 let message = H256::from(message);
+                println!("---- messsage: {:02x?}", message);
                 let sig = key.sign_recoverable(&message).expect("sign");
                 witness
                     .as_builder()

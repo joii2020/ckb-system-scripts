@@ -9,6 +9,9 @@ description = "CKB System Scripts"
 repository = "https://github.com/nervosnetwork/ckb-system-scripts"
 include = ["src/**/*", "Cargo.toml", "build.rs", "specs/cells/*"]
 
+[features]
+test_llvm_version = []
+
 [dependencies]
 includedir = "0.6"
 phf = "0.8"
